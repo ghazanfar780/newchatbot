@@ -2,8 +2,7 @@ import os
 import base64
 import zipfile
 import io
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session
-from langchain_groq import ChatGroq
+import streamlit as st
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_community.vectorstores import FAISS
@@ -14,19 +13,15 @@ import fitz  # PyMuPDF
 import pandas as pd
 from werkzeug.security import check_password_hash, generate_password_hash
 
-app = Flask(__name__)
-app.secret_key = "your_secret_key"  # Replace with a secure key
-api_key = "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"
-file_uploaded = False
-
-# Admin credentials (for simplicity, use hardcoded credentials or retrieve from DB)
+# Admin credentials
 ADMIN_USERNAME = 'admin'
 ADMIN_PASSWORD_HASH = generate_password_hash('Buch$$2024')  # Replace with your hashed password
 
-class Document:
-    def __init__(self, text, metadata=None):
-        self.page_content = text
-        self.metadata = metadata if metadata is not None else {}
+# API Key for ChatGroq
+api_key = "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"
+
+# Initialize the vector store and document retriever
+retriever = None
 
 # Function to load text from various file types
 def load_text(file_stream, file_name):
@@ -47,7 +42,7 @@ def load_pdf(file_stream):
             texts.append(page.get_text("text"))
         return texts
     except Exception as e:
-        print(f"Error processing PDF file: {e}")
+        st.error(f"Error processing PDF file: {e}")
         return []
 
 # Function to load CSV and convert to text
@@ -56,10 +51,10 @@ def load_csv(file_stream):
         df = pd.read_csv(file_stream)
         return [df.to_string()]
     except Exception as e:
-        print(f"Error processing CSV file: {e}")
+        st.error(f"Error processing CSV file: {e}")
         return []
 
-# Function to extract and process files from ZIP
+# Function to process ZIP files
 def process_zip(uploaded_file):
     docs = []
     with zipfile.ZipFile(uploaded_file) as z:
@@ -69,120 +64,83 @@ def process_zip(uploaded_file):
                 docs.extend([Document(text) for text in texts])
     return docs
 
-# Route for the home page
-@app.route('/')
-def index():
-    # Redirect to admin login if admin is not logged in
-    if 'admin_logged_in' not in session:
-        return redirect(url_for('admin_login'))
+# Class to hold document content
+class Document:
+    def __init__(self, text, metadata=None):
+        self.page_content = text
+        self.metadata = metadata if metadata is not None else {}
 
-    # If admin is logged in but no files uploaded yet, show admin dashboard
-    if not file_uploaded:
-        return redirect(url_for('admin_dashboard'))
+# Streamlit App
+def main():
+    global retriever
+    st.title("Admin Dashboard")
 
-    # If files have been uploaded, show the chat page for users
-    return redirect(url_for('user_chat'))
+    # Admin login section
+    if "admin_logged_in" not in st.session_state:
+        with st.form("login_form"):
+            st.write("Admin Login")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            login_button = st.form_submit_button("Login")
+        
+        if login_button:
+            if username == ADMIN_USERNAME and check_password_hash(ADMIN_PASSWORD_HASH, password):
+                st.session_state["admin_logged_in"] = True
+                st.success("Successfully logged in!")
+            else:
+                st.error("Invalid credentials")
+        return
 
-# Admin login route
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        if username == ADMIN_USERNAME and check_password_hash(ADMIN_PASSWORD_HASH, password):
-            session['admin_logged_in'] = True
-            return redirect(url_for('admin_dashboard'))
-        else:
-            return render_template('admin_login.html', error="Invalid credentials")
-    return render_template('admin_login.html')
-
-# Admin dashboard (file upload page)
-@app.route('/admin')
-def admin_dashboard():
-    if 'admin_logged_in' not in session:
-        return redirect(url_for('admin_login'))
+    # File Upload Section
+    st.write("Upload a ZIP file containing PDFs or CSVs")
+    uploaded_file = st.file_uploader("Choose a file", type="zip")
     
-    # Show the admin upload page
-    return render_template('admin.html')
+    if uploaded_file is not None:
+        docs = process_zip(uploaded_file)
+        if docs:
+            st.success(f"Successfully processed {len(docs)} documents")
 
-# Logout route for admin
-@app.route('/admin/logout')
-def admin_logout():
-    session.pop('admin_logged_in', None)
-    return redirect(url_for('admin_login'))
+            # Create vector store from documents
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            splits = text_splitter.split_documents(docs)
+            model_name = "all-MiniLM-L6-v2"
+            embeddings = HuggingFaceEmbeddings(model_name=model_name)
+            vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
+            retriever = vectorstore.as_retriever()
+            st.success("Document retriever is ready!")
 
-# Route to process the uploaded file
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    global file_uploaded
-    if 'admin_logged_in' not in session:
-        return jsonify({'error': 'Unauthorized access!'}), 403
+    # Question and Answer Section
+    st.title("User Chat")
+    if retriever is not None:
+        question = st.text_input("Ask a question about the documents")
+        if st.button("Submit"):
+            if question:
+                system_prompt = (
+                    "You are an assistant for question-answering tasks based on the provided/uploaded documents. "
+                    "When a query is received, first search the content of the documents to find a relevant answer. If the answer is available, "
+                    "provide a detailed and informative response, ensuring it is neither too lengthy nor too concise. "
+                    "If the query is not addressed in the documents, then you must provide the answer based on your knowledge."
+                    "\n\n{context}"
+                )
 
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded!'}), 400
+                prompt = ChatPromptTemplate.from_messages(
+                    [
+                        ("system", system_prompt),
+                        ("human", question),
+                    ]
+                )
 
-    uploaded_file = request.files['file']
-    if uploaded_file.filename == '':
-        return jsonify({'error': 'No selected file!'}), 400
+                llm = ChatGroq(model="llama3-70b-8192", groq_api_key=api_key)
+                question_answer_chain = create_stuff_documents_chain(llm, prompt)
+                rag_chain = create_retrieval_chain(retriever, question_answer_chain)
 
-    docs = process_zip(uploaded_file)
-    if not docs:
-        return jsonify({'error': 'No documents found in the ZIP file!'}), 400
-
-    # Create vector store
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    splits = text_splitter.split_documents(docs)
-    model_name = "all-MiniLM-L6-v2"
-    embeddings = HuggingFaceEmbeddings(model_name=model_name)
-    vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
-    retriever = vectorstore.as_retriever()
-
-    # Store retriever in session
-    app.config['retriever'] = retriever
-    file_uploaded = True
-    
-    # Redirect to user chat page
-    return redirect(url_for('user_chat'))
-
-# Route for querying the documents (for users to chat)
-@app.route('/ask', methods=['POST'])
-def ask_question():
-    question = request.json.get('question')
-    if 'retriever' not in app.config:
-        return jsonify({'error': 'No documents uploaded!'}), 400
-
-    retriever = app.config['retriever']
-    
-    system_prompt = (
-        "You are an assistant for question-answering tasks based on the provided/uploaded documents. "
-        "When a query is received, first search the content of the documents to find a relevant answer. If the answer is available, "
-        "provide a detailed and informative response, ensuring it is neither too lengthy nor too concise. "
-        "If the query is not addressed in the documents, then you must provide the answer based on your knowledge."
-        "\n\n{context}"
-    )
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system_prompt),
-            ("human", question),
-        ]
-    )
-
-    llm = ChatGroq(model="llama3-70b-8192", groq_api_key=api_key)
-    question_answer_chain = create_stuff_documents_chain(llm, prompt)
-    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
-
-    results = rag_chain.invoke({"input": question})
-    answer = results['answer']
-    
-    return jsonify({'answer': answer}), 200
-
-# Route for users to access the chat
-@app.route('/user_chat')
-def user_chat():
-    if not file_uploaded:
-        return "Files not uploaded yet. Please wait for the admin to upload the files."
-    return render_template('index.html')
+                results = rag_chain.invoke({"input": question})
+                answer = results['answer']
+                st.write(f"Answer: {answer}")
+            else:
+                st.error("Please enter a question")
+    else:
+        st.info("Please upload a document first")
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    main()
